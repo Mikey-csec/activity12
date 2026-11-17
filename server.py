@@ -178,6 +178,7 @@ def get_robots():
     return robots
 # --- Add robot ---
 @app.post("/robots")
-def add_robot(robot: Robot):
+@app.post("/robots")
+def add_robot(robot: Robot, current_user: str = Depends(get_current_user)):
     collection.insert_one(robot.model_dump())
     return {"message": "Robot added successfully"}
