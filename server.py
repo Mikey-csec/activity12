@@ -1,171 +1,183 @@
-import os
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from jose import JWTError, jwt
+from jose.exceptions import ExpiredSignatureError
+from datetime import datetime, timedelta
+import bcrypt
 
-from bson import ObjectId
-from bson.errors import InvalidId
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError, PyMongoError
+import os
+from dotenv import load_dotenv
 
 # Load MONGODB_URI from a local .env file (locally) or from the environment (Render).
 load_dotenv()
 
 client = MongoClient(os.environ["MONGODB_URI"])
 db = client["cs3720db"]
-collection = db["sculptures"]
+collection = db["robots"]
 
 # Create the FastAPI application and allow browser-based clients such as Expo to call the API.
 app = FastAPI()
 
+# ======== CONFIG FOR JWT ========
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 120
+
+# ======== BCRYPT HELPERS ========
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(
+        plain_password.encode("utf-8"),
+        hashed_password.encode("utf-8")
+    )
+
+# ======== SIMPLE USER "DB" (in-memory for demo) ========
+# fake_users_db = {} 
+
+# def save_user_to_db(email: str, hashed_pw: str):
+#     fake_users_db[email] = hashed_pw
+
+# def get_user_by_email(email: str):
+#     hashed_pw = fake_users_db.get(email)
+#     if not hashed_pw:
+#         return None
+#     return {"email": email, "hashed_password": hashed_pw}
+
+# ======== MONGODB USER COLLECTION ========
+users_collection = db["users"]
+
+def save_user_to_db(email: str, hashed_pw: str):
+    # Insert document into MongoDB Atlas
+    users_collection.insert_one({"email": email, "hashed_password": hashed_pw})
+
+def get_user_by_email(email: str):
+    # Query MongoDB Atlas for the user
+    user = users_collection.find_one({"email": email})
+    if not user:
+        return None
+    return {"email": user["email"], "hashed_password": user["hashed_password"]}
+
+# ======== Pydantic MODELS ========
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+# ======== OAUTH2 SCHEME ========
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# ======== JWT HELPERS ========
+def create_jwt_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# ======== 1) Implement Signup ========
+# @app.post("/signup")
+# def signup(user: UserCreate):
+#     if user.email in fake_users_db:
+#         raise HTTPException(status_code=400, detail="User already exists")
+    
+#     hashed_pw = hash_password(user.password)
+#     save_user_to_db(user.email, hashed_pw)
+#     return {"msg": "signup ok"}
+
+# ======== UPDATED SIGNUP ROUTE ========
+@app.post("/signup")
+def signup(user: UserCreate):
+    # Check MongoDB instead of dictionary
+    existing_user = get_user_by_email(user.email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    hashed_pw = hash_password(user.password)
+    save_user_to_db(user.email, hashed_pw)
+    return {"msg": "signup ok"}
+
+# ======== 2) Implement Login (Updated for Swagger Form Data) ========
+@app.post("/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # OAuth2PasswordRequestForm maps form fields to `form_data.username` and `form_data.password`
+    db_user = get_user_by_email(form_data.username)
+    if not db_user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not verify_password(form_data.password, db_user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_jwt_token({"sub": db_user["email"]})
+    return {"access_token": token, "token_type": "bearer"}
+
+# ======== 3) JWT Auth Dependency ========
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        user = get_user_by_email(email)
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        return email
+    
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ======== 4) FastAPI Protected Route EXAMPLE ========
+@app.get("/protected")
+def read_protected_data(current_user: str = Depends(get_current_user)):
+    return {"msg": f"Hello {current_user}, this is protected data!"}
+
+@app.get("/hello")
+def hello():
+    return {"message": "Hello from FastAPI"}
+
+# ========= FROM ROBOTS ===============
+from fastapi.middleware.cors import CORSMiddleware
+collection = db["robots"] # Collection name (not robots.json, just robots)
+# Optional: enable CORS if you’ll connect from React/React Native
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # or specify your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# Shared validation rules for sculpture creation and updates.
-class SculptureValidated(BaseModel):
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        extra="forbid",
-    )
-    name: str = Field(min_length=1)
-    artist: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-    imageUrl: HttpUrl
-    alt: str = Field(min_length=1)
-
-
-# Return a consistent validation error payload so clients receive readable API feedback.
-@app.exception_handler(RequestValidationError)
-async def validation_error_handler(request: Request, exc: RequestValidationError):
-    """Malformed, missing, or invalid input should return a 400 with a readable detail string."""
-    parts = []
-    for err in exc.errors():
-        loc = ".".join(str(p) for p in err.get("loc", ()) if p not in ("body", "path"))
-        msg = err.get("msg", "Invalid value")
-        parts.append(f"{loc}: {msg}" if loc else msg)
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": "; ".join(parts) or "Invalid request"},
-    )
-
-
-# Handle duplicate-name conflicts from MongoDB constraints in a client-friendly way.
-@app.exception_handler(DuplicateKeyError)
-async def duplicate_handler(request: Request, exc: DuplicateKeyError):
-    return JSONResponse(status_code=409, content={"detail": "Sculpture already exists"})
-
-
-# Surface database connectivity failures without exposing internal MongoDB details.
-@app.exception_handler(PyMongoError)
-async def database_error_handler(request: Request, exc: PyMongoError):
-    print("Database error:", repr(exc))
-    return JSONResponse(status_code=503, content={"detail": "Database not reachable"})
-
-
-# Catch unexpected server issues and return a generic 500 response.
-@app.exception_handler(Exception)
-async def unexpected_error_handler(request: Request, exc: Exception):
-    print("Unexpected error:", repr(exc))
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-
-
-def serialize(doc: dict) -> dict:
-    # MongoDB ObjectId values are not JSON serializable by default, so convert them before returning results.
-    doc["_id"] = str(doc["_id"])
-    return doc
-
-
-def require_name(name: str) -> str:
-    # Reject blank names before querying the database so empty values are never accepted.
-    if not name.strip():
-        raise HTTPException(status_code=400, detail="Sculpture name cannot be blank")
-    return name
-
-
-def parse_object_id(sculpture_id: str) -> ObjectId:
-    # Reject malformed ids with a 400 instead of letting bson raise an unexpected error.
-    try:
-        return ObjectId(sculpture_id.strip())
-    except (InvalidId, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid sculpture id")
-
-
-# Lightweight health-check endpoint used to verify the service is running.
-@app.get("/hello")
-def read_root():
-    return {"message": "Hello from FastAPI + MongoDB Atlas backend!"}
-
-
-# Return every sculpture document currently stored in MongoDB.
-@app.get("/sculptures")
-def get_sculptures():
-    return [serialize(s) for s in collection.find()]
-
-
-# Create a new sculpture record after verifying the name is not already in use.
-@app.post("/sculptures", status_code=status.HTTP_201_CREATED)
-def add_sculpture(sculpture: SculptureValidated):
-    if collection.find_one({"name": sculpture.name}):
-        raise HTTPException(status_code=409, detail="Sculpture already exists")
-    # Convert HttpUrl to a JSON-safe string before writing to MongoDB.
-    result = collection.insert_one(sculpture.model_dump(mode="json"))
-    return {"message": "Sculpture added successfully", "id": str(result.inserted_id)}
-
-
-# Update an existing sculpture (found by its current name) while preventing duplicate names.
-@app.put("/sculptures/{name}")
-def update_sculpture(sculpture: SculptureValidated, name: str = Path(min_length=1)):
-    require_name(name)
-    existing = collection.find_one({"name": name})
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"Sculpture '{name}' not found")
-
-    # Guard against renaming a sculpture to a name already used by another record.
-    duplicate = collection.find_one(
-        {"name": sculpture.name, "_id": {"$ne": existing["_id"]}}
-    )
-    if duplicate is not None:
-        raise HTTPException(
-            status_code=409, detail="Another sculpture already has that name"
-        )
-
-    result = collection.update_one(
-        {"_id": existing["_id"]}, {"$set": sculpture.model_dump(mode="json")}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Sculpture no longer exists")
-    if result.modified_count == 0:
-        return {
-            "message": "No changes needed; sculpture already has these values",
-            "id": str(existing["_id"]),
-        }
-    return {"message": "Sculpture updated successfully", "id": str(existing["_id"])}
-
-
-# Delete a sculpture by its MongoDB _id.
-@app.delete("/sculptures/{sculpture_id}")
-def delete_sculpture(sculpture_id: str = Path(min_length=1)):
-    object_id = parse_object_id(sculpture_id)
-    existing = collection.find_one({"_id": object_id})
-    if existing is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Sculpture not found. It may have already been deleted",
-        )
-
-    result = collection.delete_one({"_id": object_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Sculpture no longer exists")
-    return {
-        "message": f"Sculpture '{existing['name']}' deleted successfully",
-        "id": sculpture_id,
-    }
+# --- Minimal Pydantic model ---
+class Robot(BaseModel):
+    name: str
+    price: float
+    description: str
+    imageUrl: str
+# --- Get all robots ---
+@app.get("/robots")
+def get_robots():
+    robots = list(collection.find()) # Retrieve all documents
+    for r in robots:
+        r["_id"] = str(r["_id"]) # Convert ObjectId to string
+    return robots
+# --- Add robot ---
+@app.post("/robots")
+def add_robot(robot: Robot):
+    collection.insert_one(robot.model_dump())
+    return {"message": "Robot added successfully"}
